@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>blog.audiofool.window</string>
+    <key>CFBundleName</key><string>Window</string>
+    <key>CFBundleDisplayName</key><string>Window</string>
+    <key>CFBundleExecutable</key><string>Window</string>
+    <key>CFBundleIconFile</key><string>Window.icns</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocationUsageDescription</key><string>Window shows the real sky for your city. Your location is rounded to city level and stays on this Mac; only those rounded coordinates are sent to Open-Meteo for the weather.</string>
+    <key>NSLocationWhenInUseUsageDescription</key><string>Window shows the real sky for your city. Your location is rounded to city level and stays on this Mac; only those rounded coordinates are sent to Open-Meteo for the weather.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Window reads the song playing in Spotify to stand its cover on the windowsill. It never controls playback.</string>
+</dict></plist>
