@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 import simd
 
-/// The one place the song's colour enters the room: the lamp.
+/// The strongest hue in a cover. The room does not paint a light with it.
 public enum CoverPalette {
     /// The cover's most present strong hue, lifted into lamplight.
     /// A black-and-white cover leaves the lamp at plain incandescent.

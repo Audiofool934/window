@@ -10,6 +10,11 @@ public struct RoomLayout: Equatable, Sendable {
     public var screenSize: CGSize
     /// Pixels per point.
     public var scale: Double
+    /// Points kept clear at the top and bottom of the display, so a larger opening stays on the glass.
+    public var safeTop: Double
+    public var safeBottom: Double
+    /// The most this screen can open the window before the glass leaves it. 1 is the designed window.
+    public var maxOpeningScale: Double
     /// Where straight ahead lands on the screen, in points.
     public var eye: CGPoint
     /// Points per unit of x/z, so a point at depth z moves focal/z points per metre.
@@ -68,12 +73,10 @@ public struct RoomLayout: Equatable, Sendable {
         let openingBottom = -eyeAboveSill
         let openingTop = openingBottom + openingHeight
 
-        // Centre the window, sill, and label as one block, set slightly above the optical centre.
-        let blockTop = openingTop
-        let blockBottom = openingBottom - 0.24
-        let blockCentre = (blockTop + blockBottom) / 2
-        let contentCentreY = safeTop + contentHeight / 2 - contentHeight * 0.02
-        let eye = CGPoint(x: width / 2, y: contentCentreY + blockCentre * pointsPerMetre)
+        // The opening stays centred on the screen at every size. Its middle sits above the eye,
+        // so the horizon stays low in the glass.
+        let openingMidY = (openingBottom + openingTop) / 2
+        let eye = CGPoint(x: width / 2, y: height / 2 + openingMidY * pointsPerMetre)
 
         let left = -openingWidth / 2
         let right = openingWidth / 2
@@ -86,9 +89,12 @@ public struct RoomLayout: Equatable, Sendable {
         _ = glassHeightPoints
 
         let sillY = openingBottom
-        return RoomLayout(
+        var layout = RoomLayout(
             screenSize: screenSize,
             scale: scale,
+            safeTop: safeTop,
+            safeBottom: safeBottom,
+            maxOpeningScale: 1,
             eye: eye,
             focal: focal,
             outdoorFocal: outdoorFocal,
@@ -116,6 +122,64 @@ public struct RoomLayout: Equatable, Sendable {
             lampBaseRadius: 0.045,
             lampBaseHeight: 0.06
         )
+        layout.maxOpeningScale = layout.largestFittedOpening()
+        return layout
+    }
+
+    /// The opening at `scale`, grown equally around the screen centre. 0 is shut. 1 is the designed 1.8 m by 1.3 m window.
+    public func openingEdges(scale: Double) -> (left: Double, right: Double, bottom: Double, top: Double) {
+        let scale = max(scale, 0)
+        let midX = (openingLeft + openingRight) * 0.5
+        let midY = (openingBottom + openingTop) * 0.5
+        let halfW = (openingRight - openingLeft) * 0.5 * scale
+        let halfH = (openingTop - openingBottom) * 0.5 * scale
+        return (midX - halfW, midX + halfW, midY - halfH, midY + halfH)
+    }
+
+    /// Moves the sill and the sleeve onto the opening at `scale`. The designed layout is scale 1.
+    public func following(openingScale scale: Double) -> RoomLayout {
+        var placed = self
+        let bottom = openingEdges(scale: scale).bottom
+        let dy = bottom - openingBottom
+        placed.openingBottom = bottom
+        placed.openingTop += dy
+        placed.lampCentre.y += dy
+        placed.transoms = transoms.map { $0 + dy }
+        return placed
+    }
+
+    /// The frame thins with a shrinking opening and stays at its real thickness once the window is full size.
+    public func trimScale(for openingScale: Double) -> Double {
+        min(max(openingScale, 0), 1)
+    }
+
+    /// The hole at `scale`, on the wall, in screen points. A shut opening is empty.
+    public func openingRect(openingScale scale: Double) -> CGRect {
+        let edges = openingEdges(scale: scale)
+        let topLeft = project(SIMD3(edges.left, edges.top, wallDistance))
+        let bottomRight = project(SIMD3(edges.right, edges.bottom, wallDistance))
+        return CGRect(x: topLeft.x, y: topLeft.y, width: bottomRight.x - topLeft.x, height: bottomRight.y - topLeft.y)
+    }
+
+    /// Fully open is this fraction of the opening that would touch the screen edges.
+    public static let maxFill = 0.85
+
+    /// Largest scale on this display. A wide screen stops short of the top and bottom, a tall screen
+    /// short of the left and right, by `maxFill`. The designed window is always allowed.
+    public func largestFittedOpening(limit: Double = .greatestFiniteMagnitude) -> Double {
+        let metresToPoints = focal / wallDistance
+        let holeWidth = (openingRight - openingLeft) * metresToPoints
+        let holeHeight = (openingTop - openingBottom) * metresToPoints
+        guard holeWidth > 1, holeHeight > 1 else { return 1 }
+        let edgeToEdge = min(Double(screenSize.width) / holeWidth, Double(screenSize.height) / holeHeight)
+        return min(max(edgeToEdge * Self.maxFill, 1), limit)
+    }
+
+    /// `amount` runs from the designed window (0) to the largest this screen allows (1).
+    public func openingScale(amount: Double) -> Double {
+        let full = largestFittedOpening()
+        let t = min(max(amount, 0), 1)
+        return 1 + (full - 1) * t
     }
 
     /// Projects a world point to screen points.
@@ -124,25 +188,46 @@ public struct RoomLayout: Equatable, Sendable {
         return CGPoint(x: eye.x + p.x * k, y: eye.y - p.y * k)
     }
 
-    /// The visible glass, inside the frame, in screen points.
-    public var glassRect: CGRect {
+    /// The visible glass of the designed window, inside the frame, in screen points.
+    public var glassRect: CGRect { glassRect(openingScale: 1) }
+
+    /// The glass at `scale`. A shut opening has no glass.
+    public func glassRect(openingScale scale: Double) -> CGRect {
+        let edges = openingEdges(scale: scale)
+        let trim = trimScale(for: scale)
+        let frame = frameWidth * trim
+        let rail = bottomRail * trim
+        guard edges.right - edges.left > frame * 2 + 0.01, edges.top - edges.bottom > frame + rail + 0.01 else { return .null }
         let z = glassDepth
-        let a = project(SIMD3(openingLeft + frameWidth, openingTop - frameWidth, z))
-        let b = project(SIMD3(openingRight - frameWidth, openingBottom + bottomRail, z))
+        let a = project(SIMD3(edges.left + frame, edges.top - frame, z))
+        let b = project(SIMD3(edges.right - frame, edges.bottom + rail, z))
         return CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)
     }
 
-    /// The region that can hold the sleeve, the lamp, their glow, and the label.
+    /// The region that can hold the sleeve and the label.
+    /// The sill rides the opening, so this covers it from the shut wall down to the fully open one.
     public var objectsRect: CGRect {
-        let sillY = openingBottom
-        let lampTop = project(SIMD3(lampCentre.x, lampCentre.y + lampRadius * 3.4, lampCentre.z))
+        let sills = [
+            openingEdges(scale: 0).bottom,
+            openingBottom,
+            openingEdges(scale: max(maxOpeningScale, 1)).bottom
+        ]
+        let union = sills.reduce(into: CGRect.null) { rect, sillY in
+            rect = rect.union(objectBounds(sillY: sillY))
+        }
+        return union.integral.intersection(CGRect(origin: .zero, size: screenSize))
+    }
+
+    private func objectBounds(sillY: Double) -> CGRect {
+        let dy = sillY - openingBottom
+        let lamp = SIMD3(lampCentre.x, lampCentre.y + dy, lampCentre.z)
+        let lampTop = project(SIMD3(lamp.x, lamp.y + lampRadius * 3.4, lamp.z))
         let sleeveTop = project(SIMD3(sleeveCentreX, sillY + sleeveSize + 0.05, sleeveBaseZ))
         let left = project(SIMD3(sleeveCentreX - sleeveSize * 0.9, sillY, sillFrontDepth - 0.1))
-        let right = project(SIMD3(lampCentre.x + lampRadius * 3.4, sillY, lampCentre.z))
+        let right = project(SIMD3(lamp.x + lampRadius * 3.4, sillY, lamp.z))
         let bottom = project(SIMD3(0, sillY - sillThickness - 0.2, wallDistance))
         let top = min(lampTop.y, sleeveTop.y)
-        let rect = CGRect(x: left.x, y: top, width: right.x - left.x, height: bottom.y - top)
-        return rect.integral.intersection(CGRect(origin: .zero, size: screenSize))
+        return CGRect(x: left.x, y: top, width: right.x - left.x, height: bottom.y - top)
     }
 
     /// The baseline centre for the title, under the sleeve on the wall below the sill.

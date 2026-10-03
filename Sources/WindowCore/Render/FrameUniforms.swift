@@ -40,7 +40,10 @@ public struct FrameUniforms {
     public var cloudColour1 = SIMD4<Float>.zero
     public var cloudColour2 = SIMD4<Float>.zero
     /// x: how far the glass has crossfaded from the previous outdoor render to the latest.
+    /// y, z: the designed sill, left and right, in metres. w: the opening scale (0 shut, 1 designed).
     public var timing = SIMD4<Float>(1, 0, 0, 0)
+    /// x: how lived-in the wall is, from 0 bare to 1 fully grown. The opening does not follow it.
+    public var occupation = SIMD4<Float>.zero
     public var stars = matrix_identity_float4x4
 
     public init() {}
@@ -73,6 +76,8 @@ public struct SceneInputs: Sendable {
     /// Animation clock in seconds.
     public var time: Double = 0
     public var landscapeSeed: Double = 0
+    /// 0 is a bare wall. 1 is the most growth around the frame.
+    public var growth: Double = 0
 
     public init(date: Date, place: Coordinate, facing: Double, atmosphere: Atmosphere) {
         self.date = date
@@ -117,7 +122,7 @@ public enum Lighting {
         0.42 / pow(key + 0.0016, 0.66)
     }
 
-    /// The eye inside adapts to the room: daylight bounced off the walls, or the lamp at night.
+    /// The eye inside adapts to the room: daylight bounced off the walls, and a small even fill when the window is dark.
     public static func roomExposure(windowLuminance key: Double) -> Double {
         0.34 / (0.16 * key + 0.0028)
     }
@@ -142,7 +147,9 @@ public enum Lighting {
 
 extension FrameUniforms {
     /// Builds the frame for one display. Layer origin and size are filled per pass.
-    public static func make(layout: RoomLayout, inputs: SceneInputs) -> FrameUniforms {
+    /// `openingScale` sizes the hole. `glassRect` is the pane the outdoor view was rendered for.
+    /// The live room keeps one opening, and the glass is allocated for that full size.
+    public static func make(layout: RoomLayout, inputs: SceneInputs, openingScale: Double = 1, glassRect: CGRect? = nil) -> FrameUniforms {
         var f = FrameUniforms()
         let s = layout.scale
         func px(_ v: Double) -> Float { Float(v * s) }
@@ -153,13 +160,28 @@ extension FrameUniforms {
 
         f.screen = SIMD4(px(layout.screenSize.width), px(layout.screenSize.height), Float(s), Float(inputs.time))
         f.eye = SIMD4(px(layout.eye.x), px(layout.eye.y), px(layout.focal), px(layout.outdoorFocal))
-        f.opening = v4(layout.openingLeft, layout.openingRight, layout.openingBottom, layout.openingTop)
+        let edges = layout.openingEdges(scale: openingScale)
+        f.opening = v4(edges.left, edges.right, edges.bottom, edges.top)
+        let sillShift = edges.bottom - layout.openingBottom
         f.depths = v4(layout.wallDistance, layout.revealDepth, layout.sillProjection, layout.sillThickness)
-        f.trim = v4(layout.sillHorn, layout.frameWidth, layout.bottomRail, layout.barWidth)
-        for (i, x) in layout.mullions.prefix(4).enumerated() { f.mullionsX[i] = Float(x) }
-        for (i, y) in layout.transoms.prefix(4).enumerated() { f.transomsY[i] = Float(y) }
-        let glass = layout.glassRect
+        let trim = layout.trimScale(for: openingScale)
+        f.trim = v4(layout.sillHorn, layout.frameWidth * trim, layout.bottomRail * trim, layout.barWidth * trim)
+        let width = edges.right - edges.left
+        let height = edges.top - edges.bottom
+        // One mullion and one transom, hidden when the opening is too small to hold them.
+        if width > layout.barWidth * 6 {
+            f.mullionsX[0] = Float((edges.left + edges.right) / 2)
+        }
+        if height > 0.22 {
+            f.transomsY[0] = Float(edges.bottom + height * 0.72)
+        }
+        var glass = glassRect ?? layout.glassRect(openingScale: openingScale)
+        if glass.isNull || glass.width < 1 || glass.height < 1 { glass = layout.glassRect }
         f.glass = SIMD4(px(glass.minX), px(glass.minY), px(glass.maxX), px(glass.maxY))
+        f.timing.y = Float(layout.openingLeft)
+        f.timing.z = Float(layout.openingRight)
+        f.timing.w = Float(openingScale)
+        f.occupation = SIMD4(Float(min(max(inputs.growth, 0), 1)), 0, 0, 0)
 
         let a = inputs.facing
         // The view outside tilts up a few degrees, so the glass holds mostly sky over a low horizon.
@@ -216,11 +238,16 @@ extension FrameUniforms {
 
         let key = max(luminance(inputs.windowLight), 0)
         let adapted = max(inputs.adaptedLuminance ?? key, 0)
+        // The hole can shut, but the room keeps enough light to read as a wall.
+        // The glass keeps the real outdoor exposure either way.
+        let openness = Opening.lightOpenness(openingScale)
         let outdoorExposure = Lighting.outdoorExposure(windowLuminance: adapted)
-        let roomExposure = Lighting.roomExposure(windowLuminance: adapted)
+        let roomExposure = Lighting.roomExposure(windowLuminance: adapted * openness)
         f.exposure = v4(outdoorExposure, roomExposure, inputs.flash, Lighting.lampIntensity)
         f.lampColor = v4(inputs.lampColor, 1)
-        f.lamp = v4(layout.lampCentre, layout.lampRadius)
+        var lamp = layout.lampCentre
+        lamp.y += sillShift
+        f.lamp = v4(lamp, layout.lampRadius)
         f.windowLight = v4(inputs.windowLight, key)
         f.sleeve = v4(layout.sleeveCentreX, layout.sleeveBaseZ, layout.sleeveYaw, inputs.sleevePose)
         f.sleeve2 = v4(layout.sleeveSize, layout.sleeveThickness, inputs.coverMix, inputs.hasCover ? 1 : 0)

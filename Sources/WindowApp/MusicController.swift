@@ -1,8 +1,8 @@
 import AppKit
 import WindowCore
 
-/// Turns "now playing" into the sill: the sleeve stands or lies face down, the cover changes,
-/// and the lamp takes the cover's colour. Nothing else in the room hears the music.
+/// Turns "now playing" into the sill: the sleeve stands while something plays, and leaves when it stops.
+/// Nothing else in the room hears the music.
 final class MusicController {
     /// A pause this short is not the end of the song.
     static let pauseGrace: TimeInterval = 12
@@ -17,7 +17,6 @@ final class MusicController {
     private var web: SpotifyWebSource?
     private let artwork = ArtworkLoader()
     private var coverURL: URL?
-    private var coverLamp: SIMD3<Double>?
     private var graceTimer: Timer?
     private var loadingURI: String?
     private var running = false
@@ -115,17 +114,14 @@ final class MusicController {
                     if result.url != self.coverURL {
                         self.renderer.setCover(result.image)
                         self.coverURL = result.url
-                        self.coverLamp = CoverPalette.lampColor(for: result.image)
                         self.driver.coverChanged(crossfade: self.driver.standing)
                     }
                 } else if self.coverURL != nil {
                     // No art for this one, such as a local file: a plain sleeve, not the last song's cover.
                     self.renderer.setCover(nil)
                     self.coverURL = nil
-                    self.coverLamp = nil
                     self.driver.coverChanged(crossfade: self.driver.standing)
                 }
-                self.driver.setLamp(self.coverLamp)
                 self.driver.setStanding(true)
                 self.room.setNeedsRoomDraw()
             }
@@ -134,7 +130,6 @@ final class MusicController {
 
     private func layDown() {
         driver.setStanding(false)
-        driver.setLamp(nil)
         room.setNeedsRoomDraw()
     }
 }

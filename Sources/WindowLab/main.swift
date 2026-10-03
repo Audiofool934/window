@@ -9,7 +9,7 @@ import WindowCore
 //
 //   window-lab --out room.png [--size 2560x1440] [--scale 2] [--date 2026-10-02T13:00:00Z]
 //              [--lat 1.35 --lon 103.8] [--facing 270] [--weather rain] [--cover cover.jpg]
-//              [--title T --artist A] [--pose 0] [--no-label] [--crop x,y,w,h] [--time 12.5]
+//              [--title T --artist A] [--pose 0] [--no-label] [--crop x,y,w,h] [--time 12.5] [--opening 1] [--growth 0]
 
 struct Options {
     var out = "room.png"
@@ -36,6 +36,10 @@ struct Options {
     var reportFile: String?
     var timing = false
     var sleeveScale = 1.0
+    /// 0 is a closed wall, 1 the designed window, and larger keeps growing until the screen is full.
+    var opening = 1.0
+    /// 0 is a bare wall. 1 is moss, stems, and a little growth around the frame.
+    var growth = 0.0
 }
 
 func parse() -> Options {
@@ -77,6 +81,8 @@ func parse() -> Options {
         case "--report": o.reportFile = next()
         case "--timing": o.timing = true
         case "--sleeve-scale": o.sleeveScale = Double(next())!
+        case "--opening": o.opening = Double(next())!
+        case "--growth": o.growth = Double(next())!
         default: fatalError("unknown option \(a)")
         }
     }
@@ -147,7 +153,9 @@ if o.sleeveScale != 1 {
     layout.sleeveSize *= o.sleeveScale
     layout.sleeveBaseZ -= grown * sin(layout.sleeveLean)
 }
-let surface = try RoomSurface(layout: layout, renderer: renderer)
+let shown = min(max(o.opening, 0), layout.maxOpeningScale)
+let glassCapacity = layout.glassRect(openingScale: max(shown, 1))
+let surface = try RoomSurface(layout: layout, glass: glassCapacity, renderer: renderer)
 let place = Coordinate(latitude: o.lat, longitude: o.lon)
 let facingDegrees = o.facing ?? WindowDefaults.facingDegrees(latitude: o.lat)
 let weather: WeatherReport
@@ -166,6 +174,7 @@ inputs.landscapeSeed = o.seed
 inputs.cloudShift = [SIMD2(3.1, 1.7), SIMD2(-2.2, 4.4), SIMD2(7.5, -3.3)]
 inputs.morph = 2.5
 inputs.sleevePose = o.pose
+inputs.growth = min(max(o.growth, 0), 1)
 if let path = o.cover, let cover = loadImage(path) {
     renderer.setCover(cover)
     renderer.setCover(cover)
@@ -180,7 +189,10 @@ let sill = SillState(pose: o.pose, title: o.title, artist: o.artist, showLabel: 
 // The eye adapts to the scene without the flash, which only lasts a moment.
 let flash = inputs.flash
 inputs.flash = 0
-var frame = FrameUniforms.make(layout: layout, inputs: inputs)
+func makeFrame() -> FrameUniforms {
+    FrameUniforms.make(layout: layout, inputs: inputs, openingScale: shown, glassRect: glassCapacity)
+}
+var frame = makeFrame()
 if let buffer = renderer.queue.makeCommandBuffer() {
     renderer.encodeSkyTable(frame, into: buffer)
     renderer.encodeOutdoor(frame, surface: surface, into: buffer)
@@ -193,16 +205,19 @@ if let measured = surface.measuredWindowLight {
 }
 inputs.flash = flash
 if flash > 0, let buffer = renderer.queue.makeCommandBuffer() {
-    frame = FrameUniforms.make(layout: layout, inputs: inputs)
+    frame = makeFrame()
     renderer.encodeSkyTable(frame, into: buffer)
     renderer.encodeOutdoor(frame, surface: surface, into: buffer)
     buffer.commit()
     buffer.waitUntilCompleted()
     if let measured = surface.measuredWindowLight { inputs.windowLight = measured }
 }
-frame = FrameUniforms.make(layout: layout, inputs: inputs)
+frame = makeFrame()
 
-let rects = layout.layerRects
+var rects = layout.layerRects
+if glassCapacity.width > 1, glassCapacity.height > 1 {
+    rects.glass = PixelRect(covering: glassCapacity, scale: layout.scale)
+}
 let roomTarget = makeTarget(renderer.device, rects.room)
 let glassTarget = makeTarget(renderer.device, rects.glass)
 let objectsTarget = makeTarget(renderer.device, rects.objects)

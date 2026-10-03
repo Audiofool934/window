@@ -33,7 +33,7 @@ public struct SillState: Equatable, Sendable {
     public var title: String = ""
     public var artist: String = ""
     public var showLabel: Bool = true
-    /// Only one display holds the record; the others show the window and the lamp.
+    /// Only one display holds the record; the others show the window.
     public var showsSleeve: Bool = true
 
     public init(pose: Double = 1, title: String = "", artist: String = "", showLabel: Bool = true, showsSleeve: Bool = true) {
@@ -57,7 +57,6 @@ public final class RoomRenderer {
     private let glassPipeline: MTLRenderPipelineState
     private let roomPipeline: MTLRenderPipelineState
     private let sleevePipeline: MTLRenderPipelineState
-    private let lampPipeline: MTLRenderPipelineState
     private let shadowPipeline: MTLRenderPipelineState
     private let labelPipeline: MTLRenderPipelineState
     private let compositePipeline: MTLRenderPipelineState
@@ -97,7 +96,6 @@ public final class RoomRenderer {
         glassPipeline = try pipeline("fullscreenVertex", "glassFragment")
         roomPipeline = try pipeline("fullscreenVertex", "roomFragment")
         sleevePipeline = try pipeline("objectVertex", "sleeveFragment", samples: Self.objectSamples, blended: true)
-        lampPipeline = try pipeline("objectVertex", "lampFragment", samples: Self.objectSamples, blended: true)
         shadowPipeline = try pipeline("objectVertex", "shadowFragment", samples: Self.objectSamples, blended: true)
         labelPipeline = try pipeline("objectVertex", "labelFragment", samples: Self.objectSamples, blended: true)
         compositePipeline = try pipeline("compositeVertex", "compositeFragment", blended: true)
@@ -206,9 +204,10 @@ public final class RoomRenderer {
     }
 
     public func encodeGlass(_ frame: FrameUniforms, surface: RoomSurface, target: MTLTexture, origin: SIMD2<Float>,
-                            into buffer: MTLCommandBuffer) {
+                            scissor: MTLScissorRect? = nil, into buffer: MTLCommandBuffer) {
         encodeFullscreen(glassPipeline, frame: frame, target: target, origin: origin,
-                         textures: [surface.latestOutdoor, surface.previousOutdoor], into: buffer)
+                         textures: [surface.latestOutdoor, surface.previousOutdoor],
+                         clear: scissor != nil, scissor: scissor, into: buffer)
     }
 
     public func encodeRoom(_ frame: FrameUniforms, target: MTLTexture, origin: SIMD2<Float>, into buffer: MTLCommandBuffer) {
@@ -216,10 +215,12 @@ public final class RoomRenderer {
     }
 
     private func encodeFullscreen(_ pipeline: MTLRenderPipelineState, frame: FrameUniforms, target: MTLTexture, origin: SIMD2<Float>,
-                                  textures: [MTLTexture], into buffer: MTLCommandBuffer) {
+                                  textures: [MTLTexture], clear: Bool = false, scissor: MTLScissorRect? = nil,
+                                  into buffer: MTLCommandBuffer) {
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = target
-        pass.colorAttachments[0].loadAction = .dontCare
+        pass.colorAttachments[0].loadAction = clear ? .clear : .dontCare
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         pass.colorAttachments[0].storeAction = .store
         guard let encoder = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
         var f = frame
@@ -227,11 +228,23 @@ public final class RoomRenderer {
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentBytes(&f, length: MemoryLayout<FrameUniforms>.stride, index: 0)
         for (i, texture) in textures.enumerated() { encoder.setFragmentTexture(texture, index: i) }
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        if let scissor {
+            var rect = scissor
+            if rect.x < 0 { rect.width += rect.x; rect.x = 0 }
+            if rect.y < 0 { rect.height += rect.y; rect.y = 0 }
+            if rect.x + rect.width > target.width { rect.width = target.width - rect.x }
+            if rect.y + rect.height > target.height { rect.height = target.height - rect.y }
+            if rect.width > 0, rect.height > 0 {
+                encoder.setScissorRect(rect)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            }
+        } else {
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        }
         encoder.endEncoding()
     }
 
-    /// The sleeve, the lamp, their shadows, and the label, over a transparent layer.
+    /// The sleeve, its shadow, and the label, over a transparent layer. A sleeve that has laid down is not drawn.
     public func encodeObjects(_ frame: FrameUniforms, surface: RoomSurface, sill: SillState, target: MTLTexture,
                               origin: SIMD2<Float>, into buffer: MTLCommandBuffer) {
         guard let multisample = surface.multisampleTarget(width: target.width, height: target.height) else { return }
@@ -244,7 +257,8 @@ public final class RoomRenderer {
         guard let encoder = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
         var f = frame
         f.layer = SIMD4(origin.x, origin.y, Float(target.width), Float(target.height))
-        let layout = surface.layout
+        // The sill, lamp, and sleeve follow the opening so a centred window keeps its ledge.
+        let layout = surface.layout.following(openingScale: Double(frame.timing.w))
 
         func draw(_ pipeline: MTLRenderPipelineState, _ vertices: [ObjectVertex], textures: [MTLTexture] = []) {
             guard !vertices.isEmpty else { return }
@@ -263,10 +277,9 @@ public final class RoomRenderer {
         }
 
         draw(shadowPipeline, SillGeometry.shadows(layout: layout, pose: sill.pose, sleeve: sill.showsSleeve))
-        if sill.showsSleeve {
+        if sill.showsSleeve, SillGeometry.sleevePresence(sill.pose) > 0.02 {
             draw(sleevePipeline, SillGeometry.sleeve(layout: layout, pose: sill.pose), textures: [cover, previousCover])
         }
-        draw(lampPipeline, SillGeometry.lampQuad(layout: layout))
         if sill.showsSleeve, sill.showLabel, frame.misc.z > 0.001, let label = surface.label(title: sill.title, artist: sill.artist, device: device) {
             draw(labelPipeline, SillGeometry.labelQuad(layout: layout, size: label.size, ink: Float(surface.labelInk(frame: frame))),
                  textures: [label.texture])
@@ -313,10 +326,10 @@ public final class RoomSurface {
     private var labelCache: (key: String, texture: MTLTexture, size: CGSize)?
     private let device: MTLDevice
 
-    public init(layout: RoomLayout, renderer: RoomRenderer) throws {
+    public init(layout: RoomLayout, glass: CGRect? = nil, renderer: RoomRenderer) throws {
         self.layout = layout
         device = renderer.device
-        let glass = layout.glassRect
+        let glass = (glass?.isNull == false && (glass?.width ?? 0) > 1) ? glass! : layout.glassRect
         // Half resolution is plenty for sky and cloud; stars, rain, and frames are drawn at full size on top.
         let width = max(Int((glass.width * layout.scale / 2).rounded()), 8)
         let height = max(Int((glass.height * layout.scale / 2).rounded()), 8)
@@ -384,11 +397,11 @@ public final class RoomSurface {
     }
 
     /// Ink that reads against the wall under the sill: dark on a lit wall, pale on a dark one.
-    /// The wall there is lit by daylight bounced around the room and, at night mostly, by the lamp.
+    /// The wall there is lit by daylight bounced around the room, and by the same even fill the shader uses at night.
     func labelInk(frame: FrameUniforms) -> Double {
-        let lamp = SIMD3<Double>(Double(frame.lampColor.x), Double(frame.lampColor.y), Double(frame.lampColor.z))
-        let lampLuminance = 0.2126 * lamp.x + 0.7152 * lamp.y + 0.0722 * lamp.z
-        let bounce = Double(frame.windowLight.w) * 0.16 + lampLuminance * Double(frame.exposure.w) * 0.25 / 1.8
+        // Luminance of roomFill's colour, times the 0.18 in Room.metal. Keep the two together.
+        let fill = 0.964 * Double(frame.exposure.w) * 0.18
+        let bounce = Double(frame.windowLight.w) * 0.16 + fill
         let wall = Lighting.displayValue(bounce * 0.6 * 0.7, exposure: Double(frame.exposure.y))
         return wall > 0.42 ? max(wall - 0.36, 0.05) : min(wall + 0.42, 0.74)
     }
@@ -465,7 +478,15 @@ enum SillGeometry {
         }
     }
 
+    /// 1 while the sleeve stands, falling to 0 as it lies down. The same curve as `sleevePresence` in Room.metal.
+    static func sleevePresence(_ pose: Double) -> Double {
+        let p = min(max(pose, 0), 1)
+        let t = min(max(p / 0.40, 0), 1)
+        return 1 - t * t * (3 - 2 * t)
+    }
+
     static func sleeve(layout: RoomLayout, pose: Double) -> [ObjectVertex] {
+        guard sleevePresence(pose) > 0.02 else { return [] }
         let w = layout.sleeveSize
         let d = layout.sleeveThickness
         let t = sleeveTransform(layout: layout, pose: pose)
@@ -504,7 +525,7 @@ enum SillGeometry {
         return vertices
     }
 
-    /// Soft contact shadows on the sill: under the sleeve and around the lamp's foot.
+    /// A soft contact shadow under the sleeve while it is up. A laid-down sleeve leaves none.
     static func shadows(layout: RoomLayout, pose: Double, sleeve: Bool = true) -> [ObjectVertex] {
         var vertices: [ObjectVertex] = []
         let y = layout.openingBottom + 0.0006
@@ -526,16 +547,16 @@ enum SillGeometry {
         }
         if sleeve {
             let p = min(max(pose, 0), 1)
-            let t = sleeveTransform(layout: layout, pose: pose)
-            let a = t(SIMD3(0, 0, 0)), b = t(SIMD3(0, 0.001 + layout.sleeveSize * p, 0))
-            let centre = (a + b) / 2
-            let depthHalf = layout.sleeveThickness + abs(b.z - a.z) / 2
-            quad(centre: SIMD2(centre.x, centre.z), half: SIMD2(layout.sleeveSize / 2, depthHalf), margin: 0.018 + 0.012 * p,
-                 yaw: layout.sleeveYaw, strength: 0.5 - 0.15 * p)
+            let presence = sleevePresence(p)
+            if presence > 0.02 {
+                let t = sleeveTransform(layout: layout, pose: pose)
+                let a = t(SIMD3(0, 0, 0)), b = t(SIMD3(0, 0.001 + layout.sleeveSize * p, 0))
+                let centre = (a + b) / 2
+                let depthHalf = layout.sleeveThickness + abs(b.z - a.z) / 2
+                quad(centre: SIMD2(centre.x, centre.z), half: SIMD2(layout.sleeveSize / 2, depthHalf), margin: 0.018 + 0.012 * p,
+                     yaw: layout.sleeveYaw, strength: (0.5 - 0.15 * p) * presence)
+            }
         }
-        let lamp = layout.lampCentre
-        quad(centre: SIMD2(lamp.x, lamp.z), half: SIMD2(layout.lampBaseRadius, layout.lampBaseRadius) * 0.7, margin: 0.03,
-             yaw: 0, strength: 0.45)
         return vertices
     }
 
@@ -547,14 +568,6 @@ enum SillGeometry {
             let c = corners[i]
             return ObjectVertex(position: SIMD4(c.0, c.1, 0, 1), normal: normal, uv: SIMD4(c.2, c.3, extra.x, extra.y))
         }
-    }
-
-    static func lampQuad(layout: RoomLayout) -> [ObjectVertex] {
-        let centre = layout.project(layout.lampCentre)
-        let radius = layout.lampRadius * layout.focal / layout.lampCentre.z
-        let half = radius * 3.2
-        let rect = CGRect(x: centre.x - half, y: centre.y - half, width: half * 2, height: half * 2)
-        return screenQuad(rect, scale: layout.scale)
     }
 
     static func labelQuad(layout: RoomLayout, size: CGSize, ink: Float) -> [ObjectVertex] {

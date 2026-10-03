@@ -8,12 +8,16 @@ public final class LocationProvider: NSObject, CLLocationManagerDelegate {
         case located
         /// The reference city of the Mac's time zone, when location is not available.
         case timeZone
+        /// A place the user picked. It need not be where this Mac is.
+        case chosen
     }
 
     public var onUpdate: ((Coordinate, Origin) -> Void)?
     public private(set) var current: (coordinate: Coordinate, origin: Origin)?
     private let manager = CLLocationManager()
     private var timer: Timer?
+    /// False after `stop`, so a fix already in flight cannot publish over a place the user just chose.
+    private var running = false
 
     public override init() {
         super.init()
@@ -22,6 +26,7 @@ public final class LocationProvider: NSObject, CLLocationManagerDelegate {
     }
 
     public func start() {
+        running = true
         // The last known place first, so the sky is right from the first frame.
         if let saved = Self.saved {
             current = (saved, .located)
@@ -30,16 +35,20 @@ public final class LocationProvider: NSObject, CLLocationManagerDelegate {
         }
         if let current { onUpdate?(current.coordinate, current.origin) }
         requestIfAllowed()
+        timer?.invalidate()
         // Laptops travel; a few times a day is plenty for a sky.
         timer = Timer.scheduledTimer(withTimeInterval: 3 * 3600, repeats: true) { [weak self] _ in self?.requestIfAllowed() }
     }
 
     public func stop() {
+        running = false
         timer?.invalidate()
         timer = nil
+        manager.stopUpdatingLocation()
     }
 
     private func requestIfAllowed() {
+        guard running else { return }
         switch manager.authorizationStatus {
         case .notDetermined: manager.requestWhenInUseAuthorization()
         case .denied, .restricted: fallBack()
@@ -48,6 +57,7 @@ public final class LocationProvider: NSObject, CLLocationManagerDelegate {
     }
 
     public func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        guard running else { return }
         Debug.log("location authorization \(manager.authorizationStatus.rawValue)")
         switch manager.authorizationStatus {
         case .notDetermined: break
@@ -57,13 +67,14 @@ public final class LocationProvider: NSObject, CLLocationManagerDelegate {
     }
 
     public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        guard let location = locations.last else { return }
+        guard running, let location = locations.last else { return }
         let place = Coordinate(latitude: location.coordinate.latitude, longitude: location.coordinate.longitude).cityLevel
         Self.saved = place
         publish(place, .located)
     }
 
     public func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        guard running else { return }
         if current == nil { fallBack() }
     }
 

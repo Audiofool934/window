@@ -3,7 +3,7 @@ import Foundation
 import simd
 
 /// Moves the scene through time: cloud drift, weather easing between reports, wet glass, lightning,
-/// the lamp's colour, and the sleeve on the sill. One driver serves every display.
+/// the sleeve on the sill, and how lived-in the wall is. One driver serves every display.
 public final class SceneDriver {
     public var place: Coordinate
     /// Radians clockwise from north.
@@ -32,10 +32,33 @@ public final class SceneDriver {
     private var labelAlpha = 0.0
     public var showLabel = true
 
+    /// When set, every display uses this hole instead of the size chosen in the menu. It does not ease.
+    public private(set) var openingOverride: Double?
+    /// 0 is the designed window. 1 is the largest opening that still sits short of the screen edges.
+    public var openingAmount = 1.0
+    /// 0 is a bare wall. 1 is the most growth around the frame.
+    public private(set) var growth = 0.0
+    private var growthTarget = 0.0
+    /// A change settles over a couple of minutes, then sits. It does not move with one exchange.
+    private let growthTau = 120.0
+
     public init(place: Coordinate, facing: Double, landscapeSeed: Double) {
         self.place = place
         self.facing = facing
         self.landscapeSeed = landscapeSeed
+    }
+
+    /// Pins the hole. Pass nil to let each display keep the opening it was given.
+    public func setOpeningOverride(_ scale: Double?) {
+        openingOverride = scale.map { max($0, 0) }
+    }
+
+    /// The growth the wall is easing toward. The first look can be set at once.
+    public func setGrowth(_ value: Double, immediately: Bool = false) {
+        growthTarget = min(max(value, 0), 1)
+        if immediately || abs(growthTarget - growth) < 1e-4 {
+            growth = growthTarget
+        }
     }
 
     /// A new report: the glass eases toward it over a minute or two, as weather does.
@@ -47,7 +70,7 @@ public final class SceneDriver {
         }
     }
 
-    /// Something is playing: stand the sleeve up. Nothing is: lay it face down.
+    /// Something is playing: stand the sleeve up. Nothing is: lay it down until it is gone.
     public func setStanding(_ value: Bool) {
         guard value != standing else { return }
         standing = value
@@ -61,7 +84,7 @@ public final class SceneDriver {
         coverMix = crossfade ? 0 : 1
     }
 
-    /// The song's colour for the lamp, or plain warm white when nothing is playing.
+    /// Stored with the frame. The picture does not light a bulb from the cover.
     public func setLamp(_ color: SIMD3<Double>?) {
         lampTarget = color ?? LampColor.incandescent
     }
@@ -71,7 +94,7 @@ public final class SceneDriver {
         clock - poseStart < Self.poseDuration(rising: standing) + 0.1 || coverMix < 1 || abs(labelAlpha - labelTarget) > 0.01
     }
 
-    /// The lamp is changing colour, which reaches the whole room.
+    /// A stored colour is still easing. The picture does not show it.
     public var isLampMoving: Bool {
         simd_length(lampColor - lampTarget) > 0.01
     }
@@ -113,6 +136,8 @@ public final class SceneDriver {
 
         lightning.advance(clock: clock, thunder: atmosphere.thunder)
         lampColor += (lampTarget - lampColor) * (1 - exp(-dt / 0.6))
+        growth += (growthTarget - growth) * (1 - exp(-dt / growthTau))
+        if abs(growth - growthTarget) < 1e-4 { growth = growthTarget }
         coverMix = min(coverMix + dt / 0.8, 1)
         labelAlpha += (labelTarget - labelAlpha) * (1 - exp(-dt / 0.35))
 
@@ -153,6 +178,7 @@ public final class SceneDriver {
         inputs.labelAlpha = labelAlpha
         inputs.time = clock.truncatingRemainder(dividingBy: 7200)
         inputs.landscapeSeed = landscapeSeed
+        inputs.growth = growth
         return inputs
     }
 

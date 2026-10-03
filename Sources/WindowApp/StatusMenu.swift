@@ -1,4 +1,5 @@
 import AppKit
+import ObjectiveC
 import ServiceManagement
 import WindowCore
 
@@ -39,16 +40,37 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             menu.addItem(note("Outside: \(weather.summary)"))
         }
         if let place = app.place {
-            let lat = String(format: "%.1f°%@", abs(place.latitude), place.latitude >= 0 ? "N" : "S")
-            let lon = String(format: "%.1f°%@", abs(place.longitude), place.longitude >= 0 ? "E" : "W")
-            let origin = app.placeOrigin == .timeZone ? " (from time zone)" : ""
-            menu.addItem(note("\(lat) \(lon)\(origin)"))
+            let suffix: String
+            if app.settings.placeMode == .chosen {
+                suffix = " (chosen)"
+            } else if app.placeOrigin == .timeZone {
+                suffix = " (from time zone)"
+            } else {
+                suffix = ""
+            }
+            menu.addItem(note("\(PlaceLabel.coordinates(place))\(suffix)"))
         }
         menu.addItem(.separator())
 
         let title = action("Show Title", #selector(toggleTitle))
         title.state = app.settings.showTitle ? .on : .off
         menu.addItem(title)
+        menu.addItem(sizeItem())
+
+        let placeItem = NSMenuItem(title: "Place", action: nil, keyEquivalent: "")
+        let placeMenu = NSMenu()
+        let here = action("This Mac", #selector(useThisMac))
+        here.state = app.settings.placeMode == .automatic ? .on : .off
+        placeMenu.addItem(here)
+        if let chosen = app.settings.chosenPlace {
+            let picked = action(PlaceLabel.coordinates(chosen), #selector(useChosenPlace))
+            picked.state = app.settings.placeMode == .chosen ? .on : .off
+            placeMenu.addItem(picked)
+        }
+        placeMenu.addItem(.separator())
+        placeMenu.addItem(action("Choose on the Map…", #selector(choosePlace)))
+        placeItem.submenu = placeMenu
+        menu.addItem(placeItem)
 
         let faces = NSMenuItem(title: "Window Faces", action: nil, keyEquivalent: "")
         let facesMenu = NSMenu()
@@ -95,6 +117,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(quit)
     }
 
+    private func sizeItem() -> NSMenuItem {
+        let item = NSMenuItem()
+        let control = OpeningSizeControl(value: app.settings.openingAmount)
+        control.onChange = { [weak self] amount in
+            self?.app.setOpeningAmount(amount)
+        }
+        item.view = control
+        return item
+    }
+
     private func action(_ title: String, _ selector: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
         item.target = self
@@ -110,6 +142,12 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     @objc private func toggle() { app.room.isOn ? app.turnOff() : app.turnOn() }
     @objc private func toggleTitle() { app.setShowTitle(!app.settings.showTitle) }
     @objc private func setFacing(_ sender: NSMenuItem) { app.setFacing(sender.representedObject as? Double) }
+    @objc private func useThisMac() { app.useThisMac() }
+    @objc private func useChosenPlace() {
+        guard let chosen = app.settings.chosenPlace else { return }
+        app.useChosenPlace(chosen)
+    }
+    @objc private func choosePlace() { app.showPlacePicker() }
     @objc private func useMac() { app.setSource(.mac) }
     @objc private func useAccount() { app.setSource(.account) }
     @objc private func connect() { app.showSpotifySetup() }
@@ -130,6 +168,91 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
         }
+    }
+}
+
+/// A menu row with a slider. 0 is the designed window, 1 is as large as the screen allows.
+final class OpeningSizeControl: NSView {
+    private let label = NSTextField(labelWithString: "Size")
+    private let slider = NSSlider()
+    var onChange: ((Double) -> Void)?
+
+    init(value: Double) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 230, height: 24))
+        // The row grows with the menu. The width above is only the minimum.
+        autoresizingMask = [.width]
+        label.font = .menuFont(ofSize: 0)
+        label.textColor = .labelColor
+        label.drawsBackground = false
+        label.isBezeled = false
+        label.isEditable = false
+        label.isSelectable = false
+        slider.minValue = 0
+        slider.maxValue = 1
+        slider.doubleValue = min(max(value, 0), 1)
+        slider.controlSize = .small
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(moved)
+        slider.setAccessibilityLabel("Size")
+        addSubview(label)
+        addSubview(slider)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { nil }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 230, height: 24) }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        label.sizeToFit()
+        let labelWidth = label.bounds.width
+        // The same x as Show Title and Place. Their title fields sit in a column past the checkmark.
+        let labelX = titleColumn()
+        label.frame = NSRect(x: labelX, y: (bounds.height - label.bounds.height) / 2, width: labelWidth, height: label.bounds.height)
+        let sliderX = label.frame.maxX + 10
+        slider.frame = NSRect(x: sliderX, y: 1, width: max(bounds.width - sliderX - 14, 80), height: bounds.height - 2)
+    }
+
+    /// Where this menu draws a normal item's title, in this view's coordinates.
+    /// Falls back to the column measured on the current system menu.
+    private func titleColumn() -> CGFloat {
+        let fallback: CGFloat = 22
+        guard let table = sequence(first: self as NSView?, next: { $0?.superview }).compactMap({ $0 }).first(where: { $0 is NSTableView }) else {
+            return fallback
+        }
+        for row in table.subviews {
+            for item in row.subviews {
+                let rect = Self.titleFieldRect(of: item)
+                if rect.origin.x > 1, rect.width > 1, rect.width < item.bounds.width - 1 {
+                    return rect.origin.x
+                }
+            }
+        }
+        return fallback
+    }
+
+    /// The title field of a standard menu row. Custom rows report a rect that covers the whole item, which is ignored.
+    private static func titleFieldRect(of view: NSView) -> NSRect {
+        let selector = NSSelectorFromString("_titleFieldFrameRect")
+        guard view.responds(to: selector) else { return .zero }
+        typealias Imp = @convention(c) (AnyObject, Selector) -> NSRect
+        let implementation = unsafeBitCast(class_getMethodImplementation(type(of: view), selector), to: Imp.self)
+        return implementation(view, selector)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        slider.mouseDown(with: event)
+    }
+
+    @objc private func moved() {
+        onChange?(slider.doubleValue)
     }
 }
 

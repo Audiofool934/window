@@ -41,7 +41,8 @@ struct Frame {
     float4 misc;        // x landscape seed, y facing azimuth (rad), z label alpha, w star visibility
     float4 cloudLight[3];  // per layer (low, mid, high): xyz direction of the dominant light
     float4 cloudColour[3]; // per layer: rgb of that light where the cloud sits
-    float4 timing;      // x: blend from the previous outdoor render to the latest
+    float4 timing;      // x blend, y sill left (m), z sill right (m), w opening scale (0 shut, 1 designed)
+    float4 occupation;  // x growth, 0 bare to 1 established. The opening does not follow it.
     float4x4 stars;     // sky space to equatorial
 };
 
@@ -825,16 +826,81 @@ float3 celestial(float3 dir, constant Frame& f, float pixelAngle, float clear) {
     return colour;
 }
 
-float barCoverage(float3 p, float pixel, constant Frame& f) {
+struct BarShade {
+    float coverage;
+    float lip;
+};
+
+// The glazing bars, and a thin light along each edge. The line sits just inside the
+// silhouette so the bar reads as a dark metal edge rather than a flat strip.
+BarShade glazingBar(float3 p, float pixel, constant Frame& f) {
     float halfWidth = f.trim.w * 0.5;
-    float m = 0.0;
+    BarShade b;
+    b.coverage = 0.0;
+    b.lip = 0.0;
     for (int i = 0; i < 4; i++) {
-        float dx = abs(p.x - f.mullionsX[i]) - halfWidth;
-        m = max(m, saturate(0.5 - dx / pixel));
-        float dy = abs(p.y - f.transomsY[i]) - halfWidth;
-        m = max(m, saturate(0.5 - dy / pixel));
+        float adx = abs(p.x - f.mullionsX[i]);
+        float ady = abs(p.y - f.transomsY[i]);
+        float cx = saturate(0.5 - (adx - halfWidth) / pixel);
+        float cy = saturate(0.5 - (ady - halfWidth) / pixel);
+        float cov = max(cx, cy);
+        if (cov > b.coverage) {
+            b.coverage = cov;
+            bool vertical = cx >= cy;
+            float across = (vertical ? adx : ady) / max(halfWidth, 1e-4);
+            // A hairline just inside the silhouette. Wide enough to survive the edge, not wide enough to chrome the bar.
+            float lip = exp(-pow((across - 0.86) / 0.07, 2.0));
+            // Sky light skims the upper edge of a transom more than the lower one.
+            if (!vertical) {
+                float above = step(f.transomsY[i], p.y);
+                lip *= mix(0.45, 1.0, above);
+            }
+            b.lip = lip;
+        }
     }
-    return m;
+    return b;
+}
+
+// The glass that is open right now. When it fills the allocated pane, it is f.glass,
+// so a full window keeps the edge it was drawn with. A smaller opening sits inside that pane.
+struct OpenPane {
+    float4 rect;
+    bool inset;
+};
+
+OpenPane openPane(constant Frame& f) {
+    float depth = f.depths.x + f.depths.y;
+    float k = f.eye.z / max(depth, 1e-4);
+    float l = f.opening.x + f.trim.y;
+    float r = f.opening.y - f.trim.y;
+    float b = f.opening.z + f.trim.z;
+    float t = f.opening.w - f.trim.y;
+    float x0 = f.eye.x + l * k;
+    float x1 = f.eye.x + r * k;
+    float y0 = f.eye.y - t * k;
+    float y1 = f.eye.y - b * k;
+    float4 pane = float4(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1));
+    float mismatch = max(max(abs(pane.x - f.glass.x), abs(pane.y - f.glass.y)),
+                         max(abs(pane.z - f.glass.z), abs(pane.w - f.glass.w)));
+    OpenPane o;
+    // A couple of pixels of rounding still counts as the allocated pane, so a full window is not cropped.
+    o.inset = mismatch >= 4.0;
+    o.rect = o.inset ? pane : f.glass;
+    return o;
+}
+
+// The sill stays at its designed width, and widens only when the opening grows past it.
+float2 sillSpan(constant Frame& f) {
+    return float2(min(f.timing.y, f.opening.x), max(f.timing.z, f.opening.y));
+}
+
+// Metres from a screen point to the near edge of the glass. Zero on the edge, positive outside it.
+float sashInset(float2 px, constant Frame& f) {
+    float4 pane = openPane(f).rect;
+    float ox = max(pane.x - px.x, px.x - pane.z);
+    float oy = max(pane.y - px.y, px.y - pane.w);
+    float pxDist = (ox > 0.0 && oy > 0.0) ? length(float2(max(ox, 0.0), max(oy, 0.0))) : max(max(ox, oy), 0.0);
+    return pxDist * (f.depths.x + f.depths.y) / f.eye.z;
 }
 
 fragment float4 glassFragment(FullscreenOut in [[stage_in]],
@@ -843,6 +909,13 @@ fragment float4 glassFragment(FullscreenOut in [[stage_in]],
                               texture2d<float> previous [[texture(1)]]) {
     constexpr sampler linear(filter::linear, mip_filter::linear, address::clamp_to_edge);
     float2 px = in.position.xy + f.layer.xy;
+    OpenPane open = openPane(f);
+    float4 pane = open.rect;
+    float2 paneInset = min(px - pane.xy, pane.zw - px);
+    // Outside a smaller opening the allocated pane is clear, and the wall shows through.
+    if (open.inset && min(paneInset.x, paneInset.y) < -1.0) {
+        return float4(0.0);
+    }
     float time = f.screen.w;
     float pixelScale = f.screen.z;
     float glassDepth = f.depths.x + f.depths.y;
@@ -863,17 +936,26 @@ fragment float4 glassFragment(FullscreenOut in [[stage_in]],
     float3 dir = outdoorDirection(refracted, f);
     float pixelAngle = 1.0 / f.eye.w;
 
+    // The pane quiets in a narrow band inside the sash. The middle of the glass stays sharp.
+    float edgePx = min(paneInset.x, paneInset.y);
+    float edgeM = max(edgePx, 0.0) * metresPerPixel;
+    float onPane = step(0.0, edgePx);
+    float diffuse = smoothstep(0.018, 0.0, edgeM) * onPane;
+    if (diffuse > 0.001) {
+        float4 soft = mix(previous.sample(linear, uv, level(2.0)), latest.sample(linear, uv, level(2.0)), blend);
+        outside.rgb = mix(outside.rgb, soft.rgb, diffuse * 0.5);
+    }
+
     float3 colour = outside.rgb;
     colour += celestial(dir, f, pixelAngle * 1.2, outside.a) * outside.a * (1.0 - drops.mask * 0.6);
 
-    // Rain and snow fall between the glass and the hills, lit by the air and, close in, by the lamp.
+    // Rain and snow fall between the glass and the hills, lit by the air.
     float3 airLight = f.windowLight.rgb * 0.9;
     float rain = rainStreaks(px, time, f.weather.x, f.precip.xy, pixelScale);
-    float lampNear = f.exposure.w * 0.004 / max(f.windowLight.w + 0.004, 0.004);
-    colour += (airLight * 0.45 + f.lampColor.rgb * f.exposure.w * 0.35 * lampNear) * rain;
+    colour += airLight * 0.45 * rain;
     float nearFlake = 0.0;
     float snow = snowFlakes(px, time, f.weather.y, f.precip.xy, pixelScale, nearFlake);
-    colour += (airLight * 1.1 + f.lampColor.rgb * f.exposure.w * 0.9 * lampNear * nearFlake) * snow;
+    colour += airLight * 1.1 * snow;
 
     // Beads darken at the rim and catch the sky.
     colour *= 1.0 - drops.mask * 0.18;
@@ -882,7 +964,8 @@ fragment float4 glassFragment(FullscreenOut in [[stage_in]],
     // Frost creeps in from the corners on the coldest days.
     float frost = f.weather2.y;
     if (frost > 0.01) {
-        float2 g = (px - f.glass.xy) / glassSize;
+        float2 paneSize = max(pane.zw - pane.xy, float2(1e-3));
+        float2 g = (px - pane.xy) / paneSize;
         float edge = min(min(g.x, 1.0 - g.x), min(g.y, 1.0 - g.y) * 1.3);
         float pattern = fbm2(onGlass.xy * 60.0, 5);
         float crystals = smoothstep(0.0, 0.28 * frost, 0.12 * frost - edge + pattern * 0.12);
@@ -890,38 +973,25 @@ fragment float4 glassFragment(FullscreenOut in [[stage_in]],
         colour = mix(colour, blurred * 1.15 + f.windowLight.rgb * 0.2, crystals * 0.8);
     }
 
-    // The room reflects faintly in the glass: the lamp's globe and the warm air around it.
-    float3 lampPos = f.lamp.xyz;
-    float3 mirrored = float3(lampPos.x, lampPos.y, 2.0 * glassDepth - lampPos.z);
-    float2 mirrorPx = f.eye.xy + float2(mirrored.x, -mirrored.y) * (f.eye.z / mirrored.z);
-    float mirrorRadius = f.lamp.w * f.eye.z / mirrored.z;
-    float dm = length(px - mirrorPx);
-    float3 lampRadiance = f.lampColor.rgb * f.exposure.w;
-    // Only the lamp's glow, not a second globe: a sharp double reads as another lamp.
-    float3 reflection = f.lampColor.rgb * 0.01 * exp(-dm / (mirrorRadius * 1.8));
-    // Glass reflects what is bright inside; by day the view outside swamps it.
-    reflection *= f.weather2.w * 0.85 + 0.15;
-    // Each bead holds a tiny image of the lamp on the side that faces it, brightest close to the lamp.
-    float2 lampPx = f.eye.xy + float2(lampPos.x, -lampPos.y) * (f.eye.z / lampPos.z);
-    float2 towardLamp = normalize(lampPx - px + 1e-3);
-    float2 facingDir = -drops.offset / max(length(drops.offset), 1e-6);
-    float glint = pow(saturate(dot(facingDir, towardLamp)), 6.0) * drops.mask;
-    float near = exp(-length(lampPx - px) / (mirrorRadius * 4.0));
-    reflection += f.lampColor.rgb * glint * (0.09 * near + 0.002) * (f.weather2.w * 0.8 + 0.2);
+    // A short dark rim where the pane meets the sash. The bright line lives on the sash itself.
+    float rim = smoothstep(0.009, 0.0, edgeM) * onPane;
+    colour *= 1.0 - rim * 0.26;
 
-    // Glazing bars, at the glass plane, lit from the room and rimmed by the light behind them.
-    float bars = barCoverage(onGlass, metresPerPixel, f);
-    float3 toLamp = lampPos - onGlass;
-    float lampFall = 1.0 / (dot(toLamp, toLamp) + f.lamp.w * f.lamp.w);
-    float facing = saturate(-normalize(toLamp).z) * 0.6 + 0.4;
-    float3 barLight = lampRadiance * lampFall * facing + balancedWindowLight(f) * 0.06;
-    float3 barColour = float3(0.03, 0.031, 0.033) * barLight;
-
+    // Glazing bars, at the glass plane. Dark in the middle, with a thin light along each edge.
+    BarShade bar = glazingBar(onGlass, metresPerPixel, f);
+    float bars = bar.coverage;
     float night = f.weather2.w;
-    float3 outsideOut = colour * f.exposure.x + reflection;
+    float3 barLight = balancedWindowLight(f) * 0.06;
+    float3 barColour = float3(0.03, 0.031, 0.033) * barLight;
+    float3 barLip = balancedWindowLight(f) * (0.06 * (1.0 - night));
+    barColour += barLip * bar.lip;
+
+    float3 outsideOut = colour * f.exposure.x;
     float3 finalColour = nightVision(outsideOut, night);
     finalColour = mix(finalColour, nightVision(barColour * f.exposure.y, night), bars);
-    return float4(dither(encodeSRGB(filmic(finalColour)), px), 1.0);
+    float alpha = open.inset ? saturate(min(paneInset.x, paneInset.y) + 0.5) : 1.0;
+    float3 encoded = dither(encodeSRGB(filmic(finalColour)), px);
+    return float4(encoded * alpha, alpha);
 }
 
 // MARK: - Room pass (full screen, redrawn on demand)
@@ -943,15 +1013,20 @@ Surface findSurface(float2 px, constant Frame& f) {
     float front = wall - projection;
 
     float3 plaster = float3(0.6, 0.6, 0.585);
+    // A quiet day leans the plaster toward bare concrete. The opening stays where it is.
+    float bare = 1.0 - smoothstep(0.05, 0.42, saturate(f.occupation.x));
+    float3 wallColour = mix(plaster, float3(0.50, 0.505, 0.515), bare);
     float3 stone = float3(0.56, 0.545, 0.515);
     float3 steel = float3(0.032, 0.033, 0.035);
+    float2 sill = sillSpan(f);
+    bool shut = (right - left) < 1e-3 || (top - bottom) < 1e-3;
 
     Surface s;
     s.occlusion = 1.0;
 
     // The sill's front edge.
     float3 p = ray * front;
-    if (p.x > left - horn && p.x < right + horn && p.y < bottom && p.y > bottom - thick) {
+    if (p.x > sill.x - horn && p.x < sill.y + horn && p.y < bottom && p.y > bottom - thick) {
         s.p = p; s.n = float3(0, 0, -1); s.albedo = stone * 0.92; s.kind = 2;
         float lip = saturate((bottom - p.y) / thick);
         s.occlusion = 0.85 + 0.15 * lip;
@@ -963,8 +1038,8 @@ Surface findSurface(float2 px, constant Frame& f) {
         p = ray * t;
         if (p.z >= front && p.z <= glass) {
             bool proud = p.z < wall;
-            float l = proud ? left - horn : left;
-            float r = proud ? right + horn : right;
+            float l = proud ? sill.x - horn : sill.x;
+            float r = proud ? sill.y + horn : sill.y;
             if (p.x > l && p.x < r) {
                 s.p = p; s.n = float3(0, 1, 0); s.albedo = stone; s.kind = 1;
                 float toGlass = glass - p.z;
@@ -974,13 +1049,13 @@ Surface findSurface(float2 px, constant Frame& f) {
             }
         }
     }
-    // The wall, except where the opening is.
+    // The wall, except where the opening is. Shut, the wall is unbroken.
     p = ray * wall;
-    if (!(p.x > left && p.x < right && p.y > bottom && p.y < top)) {
-        s.p = p; s.n = float3(0, 0, -1); s.albedo = plaster; s.kind = 0;
+    if (shut || !(p.x > left && p.x < right && p.y > bottom && p.y < top)) {
+        s.p = p; s.n = float3(0, 0, -1); s.albedo = wallColour; s.kind = 0;
         // Under the sill's lip.
         float under = bottom - thick - p.y;
-        if (under > 0.0 && p.x > left - horn && p.x < right + horn) {
+        if (under > 0.0 && p.x > sill.x - horn && p.x < sill.y + horn) {
             s.occlusion = 1.0 - 0.45 * exp(-under / 0.035);
         }
         return s;
@@ -990,7 +1065,7 @@ Surface findSurface(float2 px, constant Frame& f) {
         float t = left / ray.x;
         p = ray * t;
         if (p.z >= wall && p.z <= glass && p.y >= bottom && p.y <= top) {
-            s.p = p; s.n = float3(1, 0, 0); s.albedo = plaster; s.kind = 3;
+            s.p = p; s.n = float3(1, 0, 0); s.albedo = wallColour; s.kind = 3;
             s.occlusion = 1.0 - 0.3 * exp(-(glass - p.z) / 0.04);
             return s;
         }
@@ -999,7 +1074,7 @@ Surface findSurface(float2 px, constant Frame& f) {
         float t = right / ray.x;
         p = ray * t;
         if (p.z >= wall && p.z <= glass && p.y >= bottom && p.y <= top) {
-            s.p = p; s.n = float3(-1, 0, 0); s.albedo = plaster; s.kind = 3;
+            s.p = p; s.n = float3(-1, 0, 0); s.albedo = wallColour; s.kind = 3;
             s.occlusion = 1.0 - 0.3 * exp(-(glass - p.z) / 0.04);
             return s;
         }
@@ -1008,7 +1083,7 @@ Surface findSurface(float2 px, constant Frame& f) {
         float t = top / ray.y;
         p = ray * t;
         if (p.z >= wall && p.z <= glass && p.x >= left && p.x <= right) {
-            s.p = p; s.n = float3(0, -1, 0); s.albedo = plaster * 0.97; s.kind = 3;
+            s.p = p; s.n = float3(0, -1, 0); s.albedo = wallColour * 0.97; s.kind = 3;
             s.occlusion = 1.0 - 0.3 * exp(-(glass - p.z) / 0.04);
             return s;
         }
@@ -1022,26 +1097,142 @@ Surface findSurface(float2 px, constant Frame& f) {
     return s;
 }
 
-float sillShadow(float3 p, float3 light, constant Frame& f) {
-    // The sill slab hides the lamp from the wall below it.
-    float bottom = f.opening.z;
-    if (p.y >= bottom || light.y <= bottom) return 1.0;
-    float t = (bottom - p.y) / (light.y - p.y);
-    float3 q = p + (light - p) * t;
-    float front = f.depths.x - f.depths.z;
-    float inside = smoothstep(front - 0.015, front + 0.02, q.z);
-    float across = step(f.opening.x - f.trim.x, q.x) * step(q.x, f.opening.y + f.trim.x);
-    return 1.0 - inside * across;
+// Coverage of the weeds around one edge. p.x runs across the edge, p.y up from the sill.
+struct WeedCover {
+    float stem;
+    float leaf;
+    float warm;
+    float cool;
+};
+
+WeedCover weedPatch(float2 p, float root, float sign, float bottom, float seed, float salt,
+                    float aa, float amount, int count, float spread, float height, float blooms) {
+    WeedCover w;
+    w.stem = 0.0;
+    w.leaf = 0.0;
+    w.warm = 0.0;
+    w.cool = 0.0;
+    float width = max(aa * 1.7, 0.0045);
+    float rise = p.y - bottom;
+    for (int i = 0; i < 5; i++) {
+        if (i >= count) break;
+        float fi = float(i);
+        float on = saturate(amount * float(count) - fi);
+        if (on <= 0.0) continue;
+        float2 h = hash22(float2(fi * 2.7 + salt, seed + 1.7));
+        float hgt = height * (0.22 + 0.78 * h.y);
+        float x0 = root + sign * spread * (0.04 + 0.55 * h.x);
+        float lean = (h.x - 0.35) * spread * 0.85;
+        float t = saturate(rise / max(hgt, 1e-3));
+        float sway = sin(t * 2.4 + h.y * 5.1) * spread * 0.12 * t * t;
+        float x = x0 + sign * sway + lean * t;
+        float d = abs(p.x - x);
+        float tip = 1.0 - smoothstep(0.78, 1.0, t);
+        float stem = (1.0 - smoothstep(width * 0.3, width, d)) * tip * step(-0.005, rise) * step(rise, hgt + width);
+        w.stem = max(w.stem, stem * on);
+        // A leaf or two, turned, and only on some of the stems. The rest stay dry.
+        if (h.x > 0.38) {
+            float lt = 0.46 + 0.28 * h.y;
+            float swayL = sin(lt * 2.4 + h.y * 5.1) * spread * 0.12 * lt * lt;
+            float lx = x0 + sign * swayL + lean * lt + sign * 0.008;
+            float ang = (h.y - 0.5) * 2.2 + sign * 0.6;
+            float2 q = float2(p.x - lx, rise - hgt * lt);
+            float2 r = float2(q.x * cos(ang) - q.y * sin(ang), q.x * sin(ang) + q.y * cos(ang));
+            w.leaf = max(w.leaf, (1.0 - smoothstep(0.62, 1.0, length(r / float2(0.016, 0.008)))) * on);
+        }
+        // One dull bloom on the tallest stem. It stays darker than the plaster, so night does not light it.
+        if (blooms > 0.5 && i == 0 && h.y > 0.45) {
+            float swayT = sin(0.9 * 2.4 + h.y * 5.1) * spread * 0.12 * 0.81;
+            float tx = x0 + sign * swayT + lean * 0.9;
+            float rad = 0.010 + 0.006 * h.x;
+            float2 b = float2(p.x - tx, rise - hgt * 0.9);
+            float disc = 1.0 - smoothstep(rad * 0.35, rad, length(b));
+            float which = step(0.5, h.x);
+            w.warm = max(w.warm, disc * which * on);
+            w.cool = max(w.cool, disc * (1.0 - which) * on);
+        }
+    }
+    return w;
+}
+
+void paintWeeds(thread float3& albedo, WeedCover w, float vine) {
+    albedo = mix(albedo, float3(0.26, 0.23, 0.16), w.stem);
+    albedo = mix(albedo, float3(0.17, 0.22, 0.13), w.leaf * vine);
+    albedo = mix(albedo, float3(0.42, 0.38, 0.30), w.warm * vine);
+    albedo = mix(albedo, float3(0.36, 0.36, 0.42), w.cool * vine);
+}
+
+// Moss in the joints, then dry stems, then a few leaves and small flowers. The top of the frame stays clear.
+float3 withGrowth(Surface s, constant Frame& f) {
+    float3 albedo = s.albedo;
+    float g = saturate(f.occupation.x);
+    float openW = f.opening.y - f.opening.x;
+    float openH = f.opening.w - f.opening.z;
+    if (g < 0.02 || openW < 0.05 || openH < 0.05) return albedo;
+
+    float moss = smoothstep(0.10, 0.32, g);
+    float stems = smoothstep(0.40, 0.64, g);
+    float vine = smoothstep(0.72, 0.94, g);
+    float seed = f.misc.x;
+    float aa = max(s.p.z, 0.2) / max(f.eye.z, 1.0);
+    float left = f.opening.x, right = f.opening.y, bottom = f.opening.z;
+
+    if (s.kind == 0) {
+        float lived = smoothstep(0.28, 0.75, g);
+        if (lived > 0.001) {
+            float mottling = (fbm2(s.p.xy * 1.35 + seed, 3) - 0.5) * 0.045 * lived;
+            albedo *= 1.0 + mottling;
+        }
+        float side = 0.0;
+        float outward = 0.0;
+        if (s.p.x < left) { side = -1.0; outward = left - s.p.x; }
+        else if (s.p.x > right) { side = 1.0; outward = s.p.x - right; }
+        float rise = s.p.y - bottom;
+        if (side != 0.0 && outward < 0.22 && rise > -0.04 && rise < 0.48) {
+            if (moss > 0.001 && outward < 0.14 && rise < 0.12) {
+                float patch = fbm2(s.p.xy * 11.0 + seed, 3);
+                float m = exp(-outward / 0.07) * exp(-max(rise, 0.0) / 0.06) * smoothstep(0.28, 0.58, patch);
+                albedo = mix(albedo, float3(0.13, 0.17, 0.11), m * moss);
+            }
+            if (stems > 0.001) {
+                float root = side < 0.0 ? left : right;
+                WeedCover w = weedPatch(s.p.xy, root, side, bottom, seed, side * 2.0, aa, stems, 4, 0.13, 0.32, 1.0);
+                paintWeeds(albedo, w, vine);
+            }
+        }
+    } else if (s.kind == 1 && moss > 0.001) {
+        // Only the crack where the sill meets the glass, heavier toward the jambs. The stone stays stone.
+        float glass = f.depths.x + f.depths.y;
+        float rear = 1.0 - smoothstep(0.006, 0.028, glass - s.p.z);
+        float along = abs(s.p.x) / max(abs(right), 0.2);
+        float end = smoothstep(0.45, 0.9, along);
+        float patch = 0.55 + 0.45 * fbm2(s.p.xz * 26.0 + seed, 3);
+        float m = rear * patch * mix(0.2, 1.0, end);
+        albedo = mix(albedo, float3(0.24, 0.28, 0.20), m * moss * 0.8);
+    } else if (s.kind == 3 && abs(s.n.x) > 0.5) {
+        float rise = s.p.y - bottom;
+        if (moss > 0.001 && rise < 0.22) {
+            float patch = fbm2(s.p.yz * 12.0 + seed, 3);
+            float m = exp(-max(rise, 0.0) / 0.07) * smoothstep(0.30, 0.58, patch);
+            albedo = mix(albedo, float3(0.20, 0.24, 0.16), m * moss * 0.85);
+        }
+        if (stems > 0.001 && rise > -0.02 && rise < 0.40) {
+            float salt = s.n.x > 0.0 ? -5.0 : 5.0;
+            WeedCover w = weedPatch(float2(s.p.z, s.p.y), f.depths.x + 0.02, 1.0, bottom, seed, salt, aa, stems, 3, 0.09, 0.20, 0.0);
+            paintWeeds(albedo, w, vine);
+        }
+    }
+    return albedo;
+}
+
+// Even light in the room, with no bulb and no colour from the cover.
+// The 0.18 sits on Lighting.lampIntensity (f.exposure.w) so a night wall stays readable.
+float3 roomFill(constant Frame& f) {
+    return float3(1.0, 0.96, 0.90) * f.exposure.w * 0.18;
 }
 
 float3 shadeRoomSurface(Surface s, constant Frame& f, float2 px) {
-    float3 lampPos = f.lamp.xyz;
-    float3 lampRadiance = f.lampColor.rgb * f.exposure.w;
-    float3 toLamp = lampPos - s.p;
-    float d2 = dot(toLamp, toLamp);
-    float ndl = saturate(dot(s.n, toLamp * rsqrt(d2)));
-    float shadow = (s.kind == 0 || s.kind == 2) ? sillShadow(s.p, lampPos, f) : 1.0;
-    float3 light = lampRadiance * ndl * shadow / (d2 + f.lamp.w * f.lamp.w * 0.5);
+    float3 light = roomFill(f);
 
     // The window as an area light, glowing with whatever is outside. The wall and the sill's edge face away from it.
     float3 windowLight = balancedWindowLight(f);
@@ -1049,20 +1240,41 @@ float3 shadeRoomSurface(Surface s, constant Frame& f, float2 px) {
         float glass = f.depths.x + f.depths.y;
         float l = f.opening.x + f.trim.y, r = f.opening.y - f.trim.y;
         float b = f.opening.z + f.trim.z, t = f.opening.w - f.trim.y;
-        float formFactor = quadIrradiance(s.p, s.n, float3(l, b, glass), float3(r, b, glass), float3(r, t, glass), float3(l, t, glass));
-        light += windowLight * formFactor * 2.4;
+        // A shut or tiny opening is not a light. A zero-area quad would break the form factor.
+        if ((r - l) > 0.02 && (t - b) > 0.02) {
+            float formFactor = quadIrradiance(s.p, s.n, float3(l, b, glass), float3(r, b, glass), float3(r, t, glass), float3(l, t, glass));
+            light += windowLight * formFactor * 2.4;
+        }
     }
 
     // Light that has bounced around the room behind the viewer.
-    float lampDistance = sqrt(d2);
     // Bounce from the floor lifts the lower wall a little; the ceiling side stays darker.
     float height = saturate((s.p.y + 1.2) / 2.6);
-    light += windowLight * 0.16 * (1.12 - 0.3 * height);
-    light += lampRadiance * 0.25 / (1.0 + lampDistance * lampDistance * 0.8);
+    // Daylight fill fades with the opening, down to Opening.lightFloor.
+    // Below that the hole can still close, and the wall stays readable.
+    float openness = max(saturate(f.timing.w), 0.22);
+    light += windowLight * 0.16 * (1.12 - 0.3 * height) * openness;
 
-    // Plaster is never perfectly flat.
-    float grain = 0.985 + 0.03 * noise2(s.p.xy * 3.0 + s.p.z);
-    return s.albedo * light * s.occlusion * grain;
+    // Plaster is never perfectly flat. A bare wall is a little flatter.
+    float3 albedo = withGrowth(s, f);
+    float lived = smoothstep(0.0, 0.5, saturate(f.occupation.x));
+    float grain = 0.985 + mix(0.012, 0.03, lived) * noise2(s.p.xy * 3.0 + s.p.z);
+    float3 colour = albedo * light * s.occlusion * grain;
+
+    // The sash is a dark edge with one bright line on the side that meets the glass.
+    // Added after the albedo, or the metal would swallow it.
+    if (s.kind == 4) {
+        float inset = sashInset(px, f);
+        float pixelM = (f.depths.x + f.depths.y) / f.eye.z;
+        float sigma = max(pixelM * 0.75, 0.0012);
+        float lip = exp(-pow(inset / sigma, 2.0));
+        float bevel = exp(-inset / max(pixelM * 5.0, 0.01));
+        float night = f.weather2.w;
+        float3 window = balancedWindowLight(f);
+        // By day the sky draws the line. At night the sash stays a dark edge.
+        colour += window * (0.05 * bevel + 0.22 * lip) * (1.0 - night);
+    }
+    return colour;
 }
 
 fragment float4 roomFragment(FullscreenOut in [[stage_in]], constant Frame& f [[buffer(0)]]) {
@@ -1135,15 +1347,18 @@ vertex ObjectOut objectVertex(uint vid [[vertex_id]],
     return out;
 }
 
-float3 objectLight(float3 p, float3 n, constant Frame& f) {
-    float3 lampPos = f.lamp.xyz;
-    float3 lampRadiance = f.lampColor.rgb * f.exposure.w;
-    float3 toLamp = lampPos - p;
-    float d2 = dot(toLamp, toLamp);
-    float wrap = saturate((dot(n, toLamp * rsqrt(d2)) + 0.25) / 1.25);
+// 1 while the sleeve stands, 0 once it has laid down. Matches SillGeometry.sleevePresence.
+float sleevePresence(float pose) {
+    // Gone before the card lies flat, so the plain back never rests on the sill.
+    float t = saturate(pose / 0.40);
+    return 1.0 - t * t * (3.0 - 2.0 * t);
+}
+
+float3 objectLight(float3 n, constant Frame& f) {
     float3 windowLight = balancedWindowLight(f);
-    return lampRadiance * wrap / (d2 + f.lamp.w * f.lamp.w * 0.5) + windowLight * 0.2
-         + lampRadiance * 0.25 / (1.0 + d2 * 0.8);
+    // The cover faces the room, so the window is fill. A little shaping keeps the card from looking flat.
+    float wrap = saturate(dot(n, normalize(float3(0.0, 0.15, -1.0))) * 0.35 + 0.75);
+    return (windowLight * 0.2 + roomFill(f)) * wrap;
 }
 
 fragment float4 sleeveFragment(ObjectOut in [[stage_in]],
@@ -1153,12 +1368,10 @@ fragment float4 sleeveFragment(ObjectOut in [[stage_in]],
     constexpr sampler linear(filter::linear, mip_filter::linear, address::clamp_to_edge);
     float3 n = normalize(in.normal);
     float3 albedo;
-    float gloss = 0.0;
     if (in.face < 0.5) {
         float3 now = cover.sample(linear, in.uv).rgb;
         float3 before = previous.sample(linear, in.uv).rgb;
         albedo = mix(before, now, f.sleeve2.z) * 0.92;
-        gloss = 0.05;
     } else if (in.face < 1.5) {
         // The plain back: card, with the faint ring the record has pressed into it.
         float2 c = in.uv - 0.5;
@@ -1168,60 +1381,12 @@ fragment float4 sleeveFragment(ObjectOut in [[stage_in]],
     } else {
         albedo = float3(0.62, 0.6, 0.56);
     }
-    float3 light = objectLight(in.world, n, f);
+    float3 light = objectLight(n, f);
     float3 colour = albedo * light;
-    // A thin sheen from the lamp on the printed face.
-    float3 view = normalize(-in.world);
-    float3 toLamp = normalize(f.lamp.xyz - in.world);
-    float3 halfway = normalize(view + toLamp);
-    float d2 = dot(f.lamp.xyz - in.world, f.lamp.xyz - in.world);
-    colour += f.lampColor.rgb * f.exposure.w * gloss * pow(saturate(dot(n, halfway)), 40.0) / (d2 + 0.01);
+    float presence = sleevePresence(f.sleeve.w);
     float3 c = nightVision(colour * f.exposure.y, f.weather2.w);
-    return float4(dither(encodeSRGB(filmic(c)), in.position.xy), 1.0);
-}
-
-fragment float4 lampFragment(ObjectOut in [[stage_in]], constant Frame& f [[buffer(0)]]) {
-    float2 px = in.position.xy + f.layer.xy;
-    float3 centre = f.lamp.xyz;
-    float k = f.eye.z / centre.z;
-    float2 c = f.eye.xy + float2(centre.x, -centre.y) * k;
-    float radius = f.lamp.w * k;
-    float2 d = px - c;
-    float dist = length(d);
-    float night = f.weather2.w;
-    float3 tint = f.lampColor.rgb;
-
-    // The opal globe: brightest a little below centre, where the bulb sits, and a touch darker at the rim.
-    float globe = smoothstep(radius + 0.9, radius - 0.9, dist);
-    float2 bulb = (d - float2(0.0, radius * 0.2)) / radius;
-    float core = exp(-dot(bulb, bulb) * 1.6);
-    float rim = smoothstep(0.55, 1.0, dist / radius);
-    float level = mix(1.25, 2.1, night);
-    float3 globeColour = filmic(tint * level * (0.55 + 0.75 * core) * (1.0 - 0.25 * rim));
-
-    // The foot: a short dark ceramic cylinder, lit from the globe above.
-    float sillY = f.opening.z;
-    float2 baseTop = f.eye.xy + float2(centre.x, -(centre.y - f.lamp.w * 0.85)) * k;
-    float2 baseBottom = f.eye.xy + float2(centre.x, -sillY) * k;
-    float baseHalf = f.lamp.w * 0.5 * k;
-    float inX = smoothstep(baseHalf + 0.8, baseHalf - 0.8, abs(px.x - c.x));
-    float inY = step(baseTop.y, px.y) * smoothstep(baseBottom.y + 0.8, baseBottom.y - 0.8, px.y);
-    float base = inX * inY * (1.0 - globe);
-    float across = (px.x - c.x) / max(baseHalf, 1.0);
-    float topness = 1.0 - saturate((px.y - baseTop.y) / max(baseBottom.y - baseTop.y, 1.0));
-    float3 baseLight = tint * f.exposure.w * (6.0 * topness + 0.8) * (1.0 - 0.6 * across * across) + balancedWindowLight(f) * 0.25;
-    float3 baseColour = filmic(nightVision(float3(0.05, 0.048, 0.045) * baseLight * f.exposure.y, night));
-
-    // Glare around the globe, which the eye sees more of in a dark room.
-    float outside = max(dist - radius, 0.0);
-    float glow = exp(-outside / (radius * 0.4)) * 0.5 + exp(-outside / (radius * 1.2)) * 0.1;
-    // Fade to nothing well inside the quad, so its edge never shows.
-    glow *= smoothstep(3.0 * radius, 1.6 * radius, dist);
-    float3 glare = filmic(tint * glow * mix(0.035, 0.6, night));
-
-    float alpha = saturate(globe + base);
-    float3 colour = encodeSRGB(globeColour) * globe + encodeSRGB(baseColour) * base + encodeSRGB(glare) * (1.0 - alpha);
-    return float4(colour, alpha);
+    float3 encoded = dither(encodeSRGB(filmic(c)), in.position.xy);
+    return float4(encoded * presence, presence);
 }
 
 fragment float4 shadowFragment(ObjectOut in [[stage_in]], constant Frame& f [[buffer(0)]]) {

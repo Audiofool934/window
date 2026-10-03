@@ -15,9 +15,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let location = LocationProvider()
     private var menu: StatusMenu!
     private var setupWindow: NSWindow?
+    private var placeWindow: NSWindow?
     private var hasWeather = false
     private var wakeObserver: NSObjectProtocol?
     private var toggleSource: DispatchSourceSignal?
+    private let agents = AgentActivity()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
@@ -30,14 +32,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
-        let start = LocationProvider.timeZoneCoordinate() ?? Coordinate(latitude: 51.5, longitude: 0)
+        let fallback = LocationProvider.timeZoneCoordinate() ?? Coordinate(latitude: 51.5, longitude: 0)
+        let chosen = settings.placeMode == .chosen ? settings.chosenPlace : nil
+        let start = chosen ?? fallback
         driver = SceneDriver(place: start, facing: 0, landscapeSeed: settings.landscapeSeed)
         room = RoomController(renderer: renderer, driver: driver)
         music = MusicController(renderer: renderer, driver: driver, room: room)
         setShowTitle(settings.showTitle)
-        placeChanged(start, .timeZone)
+        driver.openingAmount = settings.openingAmount
+        placeChanged(start, chosen == nil ? .timeZone : .chosen)
 
-        location.onUpdate = { [weak self] place, origin in self?.placeChanged(place, origin) }
+        location.onUpdate = { [weak self] place, origin in
+            // A fix that was already in flight must not overwrite a place just chosen on the map.
+            guard let self, self.settings.placeMode != .chosen else { return }
+            self.placeChanged(place, origin)
+        }
         weather.onUpdate = { [weak self] report in
             guard let self else { return }
             // The first report sets the sky at once; later ones ease in, as weather does.
@@ -50,6 +59,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.source == .account && !isAccountConnected { settings.source = .mac }
         music.use(settings.source, clientID: settings.clientID)
         menu = StatusMenu(app: self)
+        if let fixed = ProcessInfo.processInfo.environment["WINDOW_OPENING"].flatMap(Double.init) {
+            driver.setOpeningOverride(fixed)
+        }
+        if let saved = settings.savedGrowthState {
+            driver.setGrowth(Opening.growth(for: saved), immediately: true)
+        }
+        // Local logs only. The opening stays put. The wall eases toward the last day of use.
+        agents.start { [weak self] tokens in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let holding = self.settings.savedGrowthState ?? 0
+                let state = Opening.state(tokens: tokens, holding: holding)
+                let firstLook = self.settings.savedGrowthState == nil
+                self.settings.savedGrowthState = state
+                self.driver.setGrowth(Opening.growth(for: state), immediately: firstLook || !self.room.isOn)
+                Debug.log(String(format: "growth %d from %.0f tokens over the last day", state, tokens))
+            }
+        }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil,
                                                                          queue: .main) { [weak self] _ in
             self?.weather.refreshIfStale()
@@ -72,7 +99,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func turnOn() {
         room.turnOn()
-        location.start()
+        if settings.placeMode == .chosen, let chosen = settings.chosenPlace {
+            location.stop()
+            placeChanged(chosen, .chosen)
+        } else {
+            location.start()
+        }
         weather.start()
         music.start()
         settings.isOn = true
@@ -113,6 +145,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         room.setNeedsRoomDraw()
     }
 
+    func setOpeningAmount(_ amount: Double) {
+        let clamped = min(max(amount, 0), 1)
+        settings.openingAmount = clamped
+        driver.openingAmount = clamped
+        room.setNeedsRoomDraw()
+    }
+
     func setShowTitle(_ show: Bool) {
         settings.showTitle = show
         driver.showLabel = show
@@ -128,6 +167,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.source = source
         music.use(source, clientID: settings.clientID)
         menu.refresh()
+    }
+
+    func useThisMac() {
+        settings.placeMode = .automatic
+        if room.isOn { location.start() }
+        menu.refresh()
+    }
+
+    func useChosenPlace(_ place: Coordinate) {
+        let rounded = place.cityLevel
+        settings.chosenPlace = rounded
+        settings.placeMode = .chosen
+        location.stop()
+        placeChanged(rounded, .chosen)
+        menu.refresh()
+    }
+
+    func showPlacePicker() {
+        if let placeWindow, placeWindow.isVisible {
+            placeWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let start = settings.chosenPlace ?? place ?? LocationProvider.timeZoneCoordinate() ?? Coordinate(latitude: 51.5, longitude: 0)
+        let window = PlacePickerWindow.make(coordinate: start, usePlace: { [weak self] place in
+            self?.useChosenPlace(place)
+        }, useThisMac: { [weak self] in
+            self?.useThisMac()
+        })
+        placeWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
 
     func showSpotifySetup() {

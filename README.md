@@ -5,15 +5,14 @@ Turn it on and the desktop becomes a room looking out a window.
 Turn it off and that layer goes away, and the wallpaper you already had comes back.
 The system wallpaper is never replaced.
 
-Outside the glass follows where you are, the time, and the live weather.
+Outside the glass follows a place, the time, and the live weather.
 The sun angle, the clouds, the rain, the snow, and the fog are the real ones for that place.
 The sky does not follow the music.
 
 The song stays inside the room.
-The album cover stands on the windowsill like a record sleeve.
-Its color reaches the lamp and nothing else.
+The album cover stands on the windowsill like a record sleeve while something is playing.
 The title and artist sit in small type under the sleeve, and that label can be hidden.
-When nothing is playing, the sleeve is face down, and the window is still the picture.
+When nothing is playing, the sill is clear, and the window is still the picture.
 
 Spotify is the first source.
 The Web API reports whatever is playing on the account, including a phone, a speaker, or the computer.
@@ -21,7 +20,8 @@ That path needs a developer app whose owner account has Spotify Premium.
 The Mac app can be read locally with AppleScript and no login, but that misses playback on other devices.
 Cover art still comes from the track id.
 
-Location stays on the machine, at city level.
+The place is where this Mac is, unless you choose another on the map.
+The place stays on the machine, at city level.
 Only the latitude and longitude go out, to Open-Meteo, about every fifteen minutes.
 The sun is computed on the machine from those coordinates and the clock.
 
@@ -29,7 +29,15 @@ While it is on, one click-through window covers each display, above the wallpape
 It keeps drawing the whole time it is on, including behind other windows.
 Turning it off closes those windows and stops the drawing.
 
-This version is not an agent city, a token counter, or a visualizer.
+The window stays the size you set.
+Size in the menu runs from the designed window up to the largest that still sits a little short of the edges.
+It stays centered.
+What the day did shows in the wall, and in what has taken hold around the frame.
+Codex, Claude Code, and Grok Build leave their usage in local logs, and Window reads only those.
+A quiet day leaves the plaster a little raw and the joints bare.
+Use brings moss into the joints, then a few dry stems, and on a long day some growth and a few small flowers along the frame.
+It changes slowly, and then it sits.
+It is not a token counter, and nothing is written on the wall.
 Rain does not hit the beat.
 There is no waveform, and there are no lyrics across the sky.
 
@@ -66,6 +74,7 @@ Open at Login works best once the app lives somewhere stable, such as `/Applicat
 
 On first use macOS asks two questions.
 Location gives the city-level sky; without it Window uses the reference city of your time zone.
+Place in the menu can stand the window somewhere else instead.
 Automation of Spotify lets Window read the current song once at launch; without it Window waits for Spotify's next change notification, which needs no permission.
 Window never controls playback, and it never launches Spotify.
 
@@ -73,6 +82,8 @@ Window never controls playback, and it never launches Spotify.
 
 - **Turn On / Turn Off** opens or closes the room on every display.
 - **Show Title** shows or hides the small label under the sleeve.
+- **Size** sets how large the opening is, from the designed window up to the largest that still sits a little short of the edges.
+- **Place** uses this Mac's location, or a place chosen on the map. The window can stand somewhere you want to be.
 - **Window Faces** picks the compass direction of the view; automatically it faces the equator, or west in the tropics, where the sun stands overhead at noon.
 - **Music** chooses between Spotify on this Mac and a Spotify account.
 
@@ -92,8 +103,12 @@ While the room is on, Window asks the account what is playing every few seconds,
 - `Astronomy` computes the sun and the moon from the coordinates and the clock, after the formulas SunCalc uses, and the rotation that keeps the stars fixed to the sky.
 - `Weather` fetches Open-Meteo's current conditions with only the rounded coordinates, and turns weather codes, cloud decks, visibility, wind, and snow depth into what the glass shows.
 - `Scene` holds the room in real measurements, a 1.8 m window in a thick wall seen from a chair 2.4 m away, and the driver that moves it through time.
+  That 1.8 m is the size the window was designed at.
+  On screen the size is chosen in the menu, from that designed window up to one that stops a little short of the edges, and it stays centered.
+  A quiet day leaves the wall raw, and use lets moss, stems, and a little growth take hold around the frame.
+- `Usage` reads the local logs of Codex, Claude Code, and Grok Build and turns the last day of that use into how lived-in the wall looks. Nothing is sent off the machine.
 - `Render` and `Shaders/Room.metal` draw it with Metal.
-- `Music` has the two Spotify sources, the artwork lookup, and the step that turns a cover into lamplight.
+- `Music` has the two Spotify sources and the artwork lookup.
 - `Location` asks Location Services for a city-level fix and falls back to the time zone.
 
 `Sources/WindowApp` is the menu-bar app: one desktop window per display, the frame loop, the menu, and settings.
@@ -117,6 +132,7 @@ swift run window-lab --out room.png --date 2026-10-02T13:30:00Z --weather storm 
 ```
 
 The lab takes `--weather` presets (clear, fair, partly, cirrus, overcast, drizzle, rain, heavy, storm, snow, fog, haze, frost), `--report` with a saved Open-Meteo report, `--facing`, `--lat` and `--lon`, `--crop`, and `--timing` for per-pass GPU times.
+`--opening` sets the hole, and `--growth` sets how lived-in the wall is, from 0 to 1.
 
 Running the app's binary directly takes a few switches for checking it:
 
@@ -124,3 +140,4 @@ Running the app's binary directly takes a few switches for checking it:
 - `WINDOW_SNAPSHOT=<folder>` writes each display's live room to a PNG after a few seconds.
 - `WINDOW_DEMO_TRACK=spotify:track:<id>` pretends that track is playing, without touching Spotify.
 - `WINDOW_FPS=<n>` pins the frame rate.
+- `WINDOW_OPENING=<scale>` fixes the opening and ignores Size in the menu. 0 is the closed wall, 1 is the designed window, and a larger number keeps growing until it is a little short of the screen edge.

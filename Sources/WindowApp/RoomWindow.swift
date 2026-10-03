@@ -57,15 +57,22 @@ final class RoomView: NSView {
     init(frame: NSRect, layout: RoomLayout, renderer: RoomRenderer, showsSleeve: Bool) throws {
         self.layout = layout
         self.showsSleeve = showsSleeve
-        surface = try RoomSurface(layout: layout, renderer: renderer)
-        rects = layout.layerRects
+        // The glass is allocated for the largest opening this screen can hold.
+        // A quieter day draws a smaller hole inside it and leaves the rest clear.
+        let capacity = layout.glassRect(openingScale: layout.maxOpeningScale)
+        var rects = layout.layerRects
+        if capacity.width > 1, capacity.height > 1 {
+            rects.glass = PixelRect(covering: capacity, scale: layout.scale)
+        }
+        surface = try RoomSurface(layout: layout, glass: capacity, renderer: renderer)
+        self.rects = rects
         super.init(frame: frame)
         let host = CALayer()
         host.backgroundColor = NSColor.black.cgColor
         layer = host
         wantsLayer = true
         layerContentsRedrawPolicy = .never
-        for (metal, rect, opaque) in [(roomLayer, rects.room, true), (glassLayer, rects.glass, true), (objectsLayer, rects.objects, false)] {
+        for (metal, rect, opaque) in [(roomLayer, rects.room, true), (glassLayer, rects.glass, false), (objectsLayer, rects.objects, false)] {
             metal.device = renderer.device
             metal.pixelFormat = RoomRenderer.pixelFormat
             metal.colorspace = CGColorSpace(name: CGColorSpace.sRGB)

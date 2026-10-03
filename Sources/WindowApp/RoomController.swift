@@ -116,26 +116,39 @@ final class RoomController {
             }
         }
         let inputs = driver.inputs(at: now, windowLight: view.windowLight, adaptedLuminance: view.adaptedLuminance)
-        var frame = FrameUniforms.make(layout: view.layout, inputs: inputs)
+        // Size in the menu runs from the designed window up to this screen's largest.
+        // WINDOW_OPENING pins a scale directly and ignores the menu.
+        let chosen = view.layout.openingScale(amount: driver.openingAmount)
+        let scale = min(driver.openingOverride ?? chosen, view.layout.maxOpeningScale)
+        let capacity = view.layout.glassRect(openingScale: view.layout.maxOpeningScale)
+        var frame = FrameUniforms.make(layout: view.layout, inputs: inputs, openingScale: scale, glassRect: capacity)
+        let pane = view.layout.glassRect(openingScale: scale)
+        let showGlass = !pane.isNull && pane.width > 2 && pane.height > 2
+        view.glassLayer.isHidden = !showGlass
         guard let buffer = renderer.queue.makeCommandBuffer() else { return }
         // Cloud drifts slowly, so the view outside is rendered a few times a second and the glass crossfades
         // between the last two renders. Lightning needs every frame while it lasts.
+        // A closed wall still keeps a sky, but only often enough that opening the window is not a blank pane.
         let flashing = inputs.flash > 0.005
+        let outdoorEvery = showGlass ? Self.outdoorInterval : 8
         var renderedOutdoor = false
         if view.frameCount == 0 {
             renderedOutdoor = true
             renderer.encodeSkyTable(frame, into: buffer)
-            renderer.encodeOutdoor(frame, surface: view.surface, time: media - Self.outdoorInterval, into: buffer)
+            renderer.encodeOutdoor(frame, surface: view.surface, time: media - outdoorEvery, into: buffer)
             renderer.encodeOutdoor(frame, surface: view.surface, time: media, into: buffer)
-        } else if flashing || media - view.surface.outdoorTime >= Self.outdoorInterval {
+        } else if flashing || media - view.surface.outdoorTime >= outdoorEvery {
             renderedOutdoor = true
             renderer.encodeSkyTable(frame, into: buffer)
             renderer.encodeOutdoor(frame, surface: view.surface, time: media, into: buffer)
         }
-        let blend = flashing ? 1 : min(max((media - view.surface.outdoorTime) / Self.outdoorInterval, 0), 1)
+        let blend = flashing ? 1 : min(max((media - view.surface.outdoorTime) / outdoorEvery, 0), 1)
         frame.timing.x = Float(blend)
-        if let glass = view.glassLayer.nextDrawable() {
-            renderer.encodeGlass(frame, surface: view.surface, target: glass.texture, origin: view.rects.glass.origin, into: buffer)
+        if showGlass, let glass = view.glassLayer.nextDrawable() {
+            let scissor = scale < view.layout.maxOpeningScale - 0.02
+                ? Self.glassScissor(pane: pane, layer: view.rects.glass, scale: view.layout.scale) : nil
+            renderer.encodeGlass(frame, surface: view.surface, target: glass.texture, origin: view.rects.glass.origin,
+                                 scissor: scissor, into: buffer)
             buffer.present(glass)
         }
         // The room and the sill change slowly. Redraw them only when their light visibly changes or something on them moves,
@@ -143,7 +156,7 @@ final class RoomController {
         let signature = RoomSignature(frame: frame)
         let changed = !(view.lastSignature?.isClose(to: signature) ?? false)
         let forced = view.roomNeedsDraw || view.frameCount < 3 || inputs.flash > 0.005
-        // The full-screen room follows slow changes, such as the lamp easing to a new colour, at most twelve times a second.
+        // The full-screen room follows slow changes, such as the light through the glass, at most twelve times a second.
         let drawRoom = forced || (changed && media - view.lastRoomDraw >= 1.0 / 12)
         // The sill is small, so it follows the sleeve's movement every frame.
         let drawObjects = drawRoom || driver.isSillMoving
@@ -197,18 +210,44 @@ struct RoomSignature {
     var exposure: SIMD2<Float>
     var light: SIMD4<Float>
     var lamp: SIMD4<Float>
+    var opening: SIMD4<Float>
+    var aperture: Float
+    var growth: Float
 
     init(frame: FrameUniforms) {
         exposure = SIMD2(frame.exposure.x, frame.exposure.y)
         light = frame.windowLight
         lamp = frame.lampColor
+        opening = frame.opening
+        aperture = frame.timing.w
+        growth = frame.occupation.x
     }
 
     func isClose(to other: RoomSignature) -> Bool {
         func near(_ a: Float, _ b: Float) -> Bool { abs(a - b) <= max(abs(a), abs(b)) * 0.012 + 1e-6 }
+        let hole = max(abs(opening.x - other.opening.x), abs(opening.y - other.opening.y),
+                       abs(opening.z - other.opening.z), abs(opening.w - other.opening.w))
         return near(exposure.x, other.exposure.x) && near(exposure.y, other.exposure.y)
             && near(light.x, other.light.x) && near(light.y, other.light.y) && near(light.z, other.light.z)
             && simd_distance(lamp, other.lamp) < 0.003
+            && hole < 0.004 && abs(aperture - other.aperture) < 0.01
+            && abs(growth - other.growth) < 0.01
+    }
+}
+
+extension RoomController {
+    /// The current pane, in the glass layer's pixels, with a little extra so the soft edge is drawn.
+    static func glassScissor(pane: CGRect, layer: PixelRect, scale: Double) -> MTLScissorRect? {
+        guard pane.width > 1, pane.height > 1, scale > 0 else { return nil }
+        let px = PixelRect(covering: pane.insetBy(dx: -2 / scale, dy: -2 / scale), scale: scale)
+        let x0 = max(px.x, layer.x)
+        let y0 = max(px.y, layer.y)
+        let x1 = min(px.x + px.width, layer.x + layer.width)
+        let y1 = min(px.y + px.height, layer.y + layer.height)
+        let width = x1 - x0
+        let height = y1 - y0
+        guard width > 0, height > 0 else { return nil }
+        return MTLScissorRect(x: x0 - layer.x, y: y0 - layer.y, width: width, height: height)
     }
 }
 
